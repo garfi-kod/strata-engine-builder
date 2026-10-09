@@ -195,7 +195,7 @@ jobs:
           VERSION=$(python3 -c 'import json;print(json.load(open("bundle/BUILD.json"))["version"])')
           TAG="v$VERSION"
           ARCHS="${{ inputs.archs || '89' }}"
-          ASSET="strata-linux-x64-cuda13.zip"
+          ASSET="strata-linux-x64.zip"   # PREBUILT_ASSET on Linux; not a free choice
           cp strata-linux-x64.zip "$ASSET"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ASSET" --clobber
@@ -205,3 +205,22 @@ jobs:
               --notes "Built by workflow, archs $ARCHS. Feed it to the launcher with --prebuilt pointing at this release's download URL."
           fi
           echo "published: $TAG / $ASSET"
+          # The asset name is a contract with setup.py, not a preference: a wrong
+          # name gives HTTP 404, and the launcher then silently falls back to
+          # compiling - the exact failure this repo exists to remove. It cost one
+          # CI run to find, so the name is compared against the real constant
+          # instead of being trusted from memory.
+          echo "--- asset name check ---"
+          python3 - "$ASSET" <<'PY'
+          import re, sys
+          published = sys.argv[1]
+          src = open("engine-src/setup.py", encoding="utf-8").read()
+          want = re.search(r'^PREBUILT_ASSET\s*=\s*(.+)$', src, re.M).group(1)
+          # same expression setup.py uses, evaluated with WIN=False (Linux)
+          expected = re.findall(r'"([^"]+)"', want)[-1]
+          print("PREBUILT_ASSET on Linux:", expected)
+          print("published:", published)
+          if published != expected:
+              raise SystemExit(f"!!! asset name must be {expected}")
+          print("names match")
+          PY
