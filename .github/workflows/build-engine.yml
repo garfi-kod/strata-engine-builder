@@ -1,0 +1,188 @@
+name: build Strata engine
+
+# Compiles the Strata engine for Linux and publishes it as a release asset the
+# official launcher downloads instead of building it locally.
+#
+# No GPU is needed. CMAKE_CUDA_ARCHITECTURES is given explicitly, so nvcc only
+# compiles; nothing in the build opens a device. Verified: a clean checkout built
+# a 55 MB engine for sm_89 on a machine with no NVIDIA card.
+#
+# Both blockers that make a local build fail on a current distro are handled here:
+#   - CUDA 13.0/13.2 refuse gcc >= 16 (crt/host_config.h: __GNUC__ > 15), and
+#     CUDA 13.4 raises that to > 16, so the runner's compiler is accepted as is.
+#   - CUDA 13.4 also adds noexcept to rsqrt/rsqrtf, which glibc 2.42 (Fedora 45)
+#     requires; 13.0 and 13.2 do not, and fail on mathcalls.h with
+#     "exception specification is incompatible". So the toolkit is 13.4, not 13.0.
+#
+# The runtime libraries are bundled and the binary's RUNPATH is rewritten to
+# $ORIGIN/lib, so the engine runs on the user's machine without a CUDA install.
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: "CUDA architectures, semicolon separated (75;86;89;120)"
+        required: false
+        default: "89"
+      publish:
+        description: "Publish as a release asset"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the engine is the upstream source; this repo only carries the recipe
+          repository: Niko1221/Strata
+          path: engine-src
+
+      - name: Show what the runner has
+        run: |
+          set -euo pipefail
+          gcc --version
+          python3 --version
+          nproc
+
+      - name: Install a local CUDA 13.4
+        run: bash scripts/install-cuda.sh "$PWD/engine-src/cuda-13.4"
+
+      - name: Resolve paths
+        id: paths
+        run: |
+          set -euo pipefail
+          # A glob cannot go into $GITHUB_OUTPUT and stay a glob, so resolve it
+          # here: python3.* differs by minor version on the runner.
+          TK=$(echo "$PWD"/engine-src/cuda-13.4/.venv/lib/python3.*/site-packages/nvidia/cu13)
+          [ -d "$TK/bin" ] || { echo "no nvcc under $TK" >&2; exit 1; }
+          echo "tk=$TK" >> "$GITHUB_OUTPUT"
+          pip install --quiet cmake ninja
+          echo "cmake=$(command -v cmake)" >> "$GITHUB_OUTPUT"
+          echo "ninja=$(command -v ninja)"  >> "$GITHUB_OUTPUT"
+
+      - name: Fetch llama.cpp at the pinned commit
+        run: |
+          set -euo pipefail
+          COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d
+          cd engine-src
+          mkdir -p third_party
+          curl -fsSL -o third_party/llama.zip \
+            "https://github.com/ggml-org/llama.cpp/archive/$COMMIT.zip"
+          cd third_party
+          unzip -q llama.zip
+          mv "llama.cpp-$COMMIT" llama.cpp
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          ARCHS="${{ inputs.archs || '89' }}"
+          TK=$(echo ${{ steps.paths.outputs.tk }})
+          cd engine-src
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_MAKE_PROGRAM=${{ steps.paths.outputs.ninja }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTRATA_ENABLE_CUDA=ON \
+            -DSTRATA_BUILD_TESTS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" \
+            -DCMAKE_CUDA_COMPILER="$TK/bin/nvcc" \
+            -DCUDAToolkit_ROOT="$TK" \
+            -DSTRATA_GGML_DIR="$PWD/third_party/llama.cpp"
+
+      - name: Build
+        run: cmake --build engine-src/build --target strata -j"$(nproc)"
+
+      - name: Make it runnable without a CUDA install
+        run: |
+          set -euo pipefail
+          TK=$(echo ${{ steps.paths.outputs.tk }})
+          BIN=engine-src/build/strata
+          [ -f "$BIN" ] || { echo "!!! $BIN missing" >&2; exit 1; }
+          mkdir -p bundle/lib
+          cp -L "$BIN" bundle/strata
+          for f in libcudart libcublas libcublasLt; do
+            cp -L "$TK/lib/$f.so."* bundle/lib/
+          done
+          # Without this the RUNPATH points at the build machine's absolute
+          # toolkit path and the engine cannot start on the user's machine.
+          patchelf --set-rpath '$ORIGIN/lib' bundle/strata
+
+      - name: Gate on the artifact
+        run: |
+          set -euo pipefail
+          BIN=bundle/strata
+          echo "size: $(du -h "$BIN" | cut -f1)"
+          SM=$(strings "$BIN" | grep -oE 'sm_[0-9]{2,3}' | sort -u | tr '\n' ' ')
+          echo "archs in binary: ${SM:-none}"
+          [ -n "$SM" ] || { echo "!!! no CUDA arch in the binary" >&2; exit 1; }
+          ldd "$BIN" | grep libcudart \
+            || { echo "!!! not a CUDA build (no cudart)" >&2; exit 1; }
+          readelf -d "$BIN" | grep -F '$ORIGIN/lib' \
+            || { echo "!!! RUNPATH is not \$ORIGIN-relative" >&2; exit 1; }
+          readelf -d "$BIN" | grep -F "$HOME" \
+            && { echo "!!! an absolute build path survived in RUNPATH" >&2; exit 1; }
+          # control row: with the bundle it must start
+          ./bundle/strata --version || { echo "!!! engine does not start" >&2; exit 1; }
+          # ... and without the libraries it must fail, or the gate proves nothing
+          mv bundle/lib bundle/lib_gone
+          if ./bundle/strata --version; then
+            echo "!!! it started with no libraries: the gate is not a gate" >&2; exit 1
+          else
+            echo "control: fails without the bundled libraries (expected)"
+          fi
+          mv bundle/lib_gone bundle/lib
+
+      - name: Write BUILD.json
+        run: |
+          set -euo pipefail
+          ARCHS="${{ inputs.archs || '89' }}"
+          mkdir -p bundle
+          # BUILD.json is read next to the engine binary: "source": "prebuilt"
+          # and "archs" are what the launcher checks to accept the engine as-is,
+          # and a missing arch would send it back to compiling.
+          python3 - "$ARCHS" <<'PY'
+          import json, re, sys
+          archs = sorted({int(a) for a in sys.argv[1].replace(',', ';').split(';') if a.strip()})
+          version = re.search(r"project\(strata VERSION ([\d.]+)",
+                              open("engine-src/CMakeLists.txt").read()).group(1)
+          json.dump({"source": "prebuilt", "version": version, "archs": archs,
+                     "vision": "none", "cuda": "13.4", "ptx": True},
+                    open("bundle/BUILD.json", "w"), indent=1)
+          print("BUILD.json:", version, archs)
+          PY
+          cat bundle/BUILD.json
+
+      - name: Zip
+        run: |
+          set -euo pipefail
+          cd bundle && zip -q9 ../strata-linux-x64.zip strata BUILD.json lib/*
+          cd ..
+          ls -lh strata-linux-x64.zip
+          unzip -l strata-linux-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-engine
+          path: strata-linux-x64.zip
+          retention-days: 30
+
+      - name: Publish release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=strata-engine
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" strata-linux-x64.zip --clobber
+          else
+            gh release create "$TAG" strata-linux-x64.zip \
+              --title "Strata engine for Linux (CUDA 13.4)" \
+              --notes "Built by workflow, archs ${{ inputs.archs || '89' }}. Feed it to the launcher: ./setup.sh --prebuilt <url>"
+          fi
