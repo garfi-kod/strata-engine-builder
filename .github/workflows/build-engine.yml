@@ -38,10 +38,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
         with:
-          # the engine is the upstream source; this repo only carries the recipe
+          # Two checkouts, not one with repository:. A checkout with
+          # repository: does NOT check this repo out, so scripts/ never exists.
           repository: Niko1221/Strata
+          # v0.1.41 is what the launcher's MIN_ENGINE asks for; tracking main
+          # would build an engine the launcher then refuses.
+          ref: v0.1.41
           path: engine-src
+
+      - name: Tools the bundle step needs
+        run: sudo apt-get install --yes --quiet zip unzip patchelf
 
       - name: Show what the runner has
         run: |
