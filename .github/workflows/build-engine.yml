@@ -196,7 +196,7 @@ jobs:
           TAG="v$VERSION"
           ARCHS="${{ inputs.archs || '89' }}"
           ASSET="strata-linux-x64.zip"   # PREBUILT_ASSET on Linux; not a free choice
-          cp strata-linux-x64.zip "$ASSET"
+          # no cp here: the Zip step already writes exactly this name
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ASSET" --clobber
           else

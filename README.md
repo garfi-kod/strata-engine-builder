@@ -34,7 +34,7 @@ Run the workflow (`workflow_dispatch`), pick your architecture, and point the
 launcher at the published asset:
 
 ```bash
-./setup.sh --prebuilt https://github.com/<you>/strata-engine-builder/releases/download/strata-engine/
+./setup.sh --prebuilt https://github.com/garfi-kod/strata-engine-builder/releases/download/v0.1.41/
 ```
 
 | archs | card |
