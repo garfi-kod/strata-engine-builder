@@ -187,11 +187,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG=strata-engine
+          # The tag must be v<version>, not a free-form name: release_of() in the
+          # launcher only recognises ".../releases/download/v<tag>/", so a tag
+          # like "strata-engine" makes it skip the published digest entirely and
+          # look the file up as "latest" instead. This shape also gives the
+          # versioned base the launcher itself offers as PREBUILT_TAG_URL.
+          VERSION=$(python3 -c 'import json;print(json.load(open("bundle/BUILD.json"))["version"])')
+          TAG="v$VERSION"
+          ARCHS="${{ inputs.archs || '89' }}"
+          ASSET="strata-linux-x64-cuda13.zip"
+          cp strata-linux-x64.zip "$ASSET"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" strata-linux-x64.zip --clobber
+            gh release upload "$TAG" "$ASSET" --clobber
           else
-            gh release create "$TAG" strata-linux-x64.zip \
-              --title "Strata engine for Linux (CUDA 13.4)" \
-              --notes "Built by workflow, archs ${{ inputs.archs || '89' }}. Feed it to the launcher: ./setup.sh --prebuilt <url>"
+            gh release create "$TAG" "$ASSET" \
+              --title "Strata engine v$VERSION for Linux (CUDA 13.4)" \
+              --notes "Built by workflow, archs $ARCHS. Feed it to the launcher with --prebuilt pointing at this release's download URL."
           fi
+          echo "published: $TAG / $ASSET"
